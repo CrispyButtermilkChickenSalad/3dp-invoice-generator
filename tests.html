@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>3-IG logic tests</title></head>
+<body>
+<h1>3-IG logic tests</h1>
+<pre id="results">Running…</pre>
+<script type="module">
+import { calculate, parseGcode, invoiceCSV, duration, processingDescriptions, money, currencyDigits, favouritesFirst, normalizeHex } from './core.js';
+import { printerCatalogue, parsePrinterPresets, readWorkspace, workspaceBackup, rememberCustomer } from './profiles.js';
+const results = [];
+function test(name, fn) {
+  try { fn(); results.push({ name, passed: true }); }
+  catch (error) { results.push({ name, passed: false, error: error.message }); }
+}
+function equal(actual, expected) { if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`); }
+function near(actual, expected) { if (Math.abs(actual - expected) > 0.00001) throw new Error(`${actual} !== ${expected}`); }
+const printers = [{ id: 'p1', watts: 100, price: 1000, lifetime: 1000, maintenance: 0.5 }, { id: 'p2', watts: 200, price: 2000, lifetime: 1000, maintenance: 1 }];
+const filaments = [{ id: 'f1', price: 20, spoolWeight: 1000 }];
+const plate = { id: 'a', name: 'Test', hours: 2, grams: 100, quantity: 2, printerId: 'p1', filamentId: 'f1' };
+const job = { number: 'INV-1', name: 'Test', customer: { name: 'A' }, plates: [plate], energyRate: 0.3, failureRate: 20, prepMinutes: 30, finishMinutes: 30, labourRate: 20, packaging: 2, other: 1, markup: 50, shipping: 5, taxEnabled: true, taxRate: 10 };
+test('Quantity scales all plate production costs, not job labour', () => {
+  const t = calculate(job, printers, filaments);
+  near(t.material, 4); near(t.machine, 6); near(t.electricity, 0.12); near(t.failure, 2.53); near(t.labour, 20); near(t.total, 64.33);
+});
+test('Parallel printers use the longest per-machine queue', () => {
+  const t = calculate({ ...job, plates: [plate, { ...plate, id: 'b', quantity: 1, hours: 3 }, { ...plate, id: 'c', quantity: 1, hours: 6, printerId: 'p2' }] }, printers, filaments);
+  near(t.elapsed, 7); near(t.hours, 13);
+});
+test('Missing profiles surface an error', () => {
+  let threw = false; try { calculate(job, [], filaments); } catch { threw = true; } equal(threw, true);
+});
+test('PrusaSlicer normal duration and multi-tool weight', () => {
+  const result = parseGcode('; estimated printing time (normal mode) = 1d 2h 3m 4s\n; filament used [g] = 12.5, 3.2\n; estimated printing time (silent mode) = 2d');
+  near(result.hours, 26 + 3 / 60 + 4 / 3600); near(result.grams, 15.7);
+});
+test('Orca / Bambu metadata', () => {
+  const result = parseGcode('; model printing time: 2h 15m; total estimated time: 2h 20m\n; total filament used [g] = 82.4');
+  near(result.hours, 2 + 20 / 60); near(result.grams, 82.4);
+});
+test('Cura metres use filament density and cross-sectional area', () => {
+  const result = parseGcode(';TIME:5400\n;Filament used: 2m', 1.27, 1.75);
+  near(result.hours, 1.5); near(result.grams, 2000 * Math.PI * (1.75 / 2) ** 2 / 1000 * 1.27);
+});
+test('Prusa length in mm with multiple tools', () => {
+  const result = parseGcode('; filament used [mm] = 1000, 500');
+  near(result.lengthMm, 1500);
+});
+test('Missing metrics are null, never fabricated estimates', () => {
+  const result = parseGcode('G1 X50 Y50 E10\n;LAYER:0');
+  equal(result.hours, null); equal(result.grams, null);
+});
+test('Binary G-code is rejected', () => {
+  let threw = false; try { parseGcode('GCDE\0test'); } catch { threw = true; } equal(threw, true);
+});
+test('GST is opt-in and shipping is not marked up', () => {
+  const t = calculate({ ...job, taxEnabled: false, shipping: 0 }, printers, filaments);
+  near(t.tax, 0); near(t.total + 5, calculate({ ...job, taxEnabled: false }, printers, filaments).total);
+});
+test('CSV escapes user content and prevents formula injection', () => {
+  const csv = invoiceCSV({ ...job, name: '=HYPERLINK("bad")' }, calculate(job, printers, filaments));
+  equal(csv.includes(`"'=HYPERLINK(""bad"")"`), true);
+  equal(csv.includes('64.33'), true);
+});
+test('Invoice line amounts add up exactly to the subtotal', () => {
+  const t = calculate({ ...job, plates: [plate, { ...plate, id: 'b', grams: 111.111 }] }, printers, filaments);
+  near(t.lines.reduce((sum, line) => sum + line.amount, 0) + t.serviceAmount + job.shipping, t.subtotal);
+  near(t.subtotal + t.tax, t.total);
+});
+test('Invalid saved numeric values cannot silently produce NaN totals', () => {
+  for (const update of [{ failureRate: 100 }, { markup: null }, { plates: [{ ...plate, quantity: 1.5 }] }]) {
+    let threw = false; try { calculate({ ...job, ...update }, printers, filaments); } catch { threw = true; }
+    equal(threw, true);
+  }
+});
+test('Time display carries rounded minutes into hours', () => equal(duration(1.999), '2h 0m'));
+test('Half-cent GST rounds up without binary floating-point drift', () => {
+  const t = calculate({ ...job, plates: [], prepMinutes: 0, finishMinutes: 0, packaging: 42.65, other: 0, markup: 0, shipping: 0 }, printers, filaments);
+  near(t.subtotal, 42.65); near(t.tax, 4.27); near(t.total, 46.92);
+});
+function workspaceFixture(version = 2) {
+  const current = {
+    job: { ...structuredClone(job), id: 'job1', sample: false, date: '2026-11-16', dueDate: '', notes: '', payment: 'Bank transfer',
+      customer: { name: 'Test customer', email: 'test@example.com', company: '', address: '', abn: '' }, customerType: 'individual',
+      sections: { address: false, business: false, metrics: false, payment: true, notes: false, processing: true },
+      prepDescription: 'Slicing and setup.', finishDescription: 'Support removal.',
+      plates: [{ ...plate, detail: 'test.gcode', verified: true }] },
+    printers: printers.map(p => ({ ...p, name: p.id, model: 'Test printer', color: '#123456' })),
+    filaments: filaments.map(f => ({ ...f, name: 'PLA', brand: 'Test', color: '#abcdef', colorName: 'Test colour', density: 1.24, diameter: 1.75 })),
+    studio: { name: 'Test studio', email: '', address: '', abn: '' },
+  };
+  return { version, ...current, saved: [structuredClone(current)], customers: [], settings: { theme: 'dark' } };
+}
+test('Catalogue contains unique common printer models without fabricated running costs', () => {
+  equal(printerCatalogue.length >= 40, true);
+  equal(new Set(printerCatalogue.map(item => item.id)).size, printerCatalogue.length);
+  equal(printerCatalogue.find(item => item.name === 'Bambu Lab P1S').watts, undefined);
+});
+test('Orca / Bambu machine presets import identity and geometry only', () => {
+  const [preset] = parsePrinterPresets(JSON.stringify({ type: 'machine', name: 'P1S 0.4 nozzle', printer_model: 'Bambu Lab P1S',
+    nozzle_diameter: ['0.4'], printable_area: ['0x0', '256x0', '256x256', '0x256'], machine_start_gcode: 'M999', price: 999 }), 'machine.json');
+  equal(preset.name, 'P1S 0.4 nozzle');
+  equal(preset.model.includes('256 × 256 mm bed'), true);
+  equal(preset.model.includes('0.4 mm nozzle'), true);
+  equal(preset.price, undefined);
+  equal(preset.machine_start_gcode, undefined);
+});
+test('Prusa configuration bundles exclude print, filament and internal sections', () => {
+  const presets = parsePrinterPresets('[printer:*base*]\nnozzle_diameter = 0.6\n[printer:MK4S]\nprinter_model = MK4S\nnozzle_diameter = 0.4\n[filament:PLA]\nname = PLA\n[printer:MINI]\nprinter_model = MINI\n', 'bundle.ini');
+  equal(presets.map(item => item.name), ['MK4S', 'MINI']);
+  equal(presets[0].model, 'MK4S · 0.4 mm nozzle');
+  equal(presets[1].model, 'MINI');
+});
+test('Flat PrusaSlicer printer config imports without a bundle section', () => {
+  equal(parsePrinterPresets('printer_settings_id = "My MK4S"\nprinter_model = MK4S\nnozzle_diameter = 0.4', 'printer.ini')[0].name, 'My MK4S');
+});
+test('Invalid and non-printer preset imports are rejected', () => {
+  for (const text of ['null', '{"type":"filament","name":"PLA"}', '{invalid']) {
+    let threw = false; try { parsePrinterPresets(text, 'test.json'); } catch { threw = true; }
+    equal(threw, true);
+  }
+});
+test('Workspace backup round-trips all records, descriptions and theme', () => {
+  const original = workspaceFixture();
+  rememberCustomer(original, original.job);
+  const restored = readWorkspace(JSON.parse(JSON.stringify(workspaceBackup(original))));
+  equal(restored, readWorkspace(original));
+  equal(restored.job.prepDescription, 'Slicing and setup.');
+  equal(restored.customers.length, 1);
+});
+test('Legacy workspaces migrate without losing invoices, profiles or custom notes', () => {
+  const old = workspaceFixture(1);
+  old.job.notes = 'Keep this customer note.';
+  delete old.job.sections.processing;
+  delete old.job.prepDescription;
+  const migrated = readWorkspace(old);
+  equal(migrated.version, 3);
+  equal(migrated.job.notes, 'Keep this customer note.');
+  equal(migrated.job.sections.processing, true);
+  equal(migrated.saved.length, 1);
+  equal(migrated.printers.length, 2);
+  equal(migrated.customers.length, 1);
+});
+test('Malformed nested backups are rejected without mutating their input', () => {
+  for (const corrupt of [
+    w => { w.job.plates[0].printerId = 'missing'; },
+    w => { w.printers[0].lifetime = 0; },
+    w => { w.filaments[0].color = 'red;display:none'; },
+    w => { w.saved[0].job.plates[0].quantity = 1.5; },
+    w => { w.version = 100; },
+    w => { w.customers = [{ name: 'Missing required fields' }]; },
+  ]) {
+    const bad = workspaceFixture(); corrupt(bad);
+    const before = JSON.stringify(bad);
+    let threw = false; try { readWorkspace(bad); } catch { threw = true; }
+    equal(threw, true); equal(JSON.stringify(bad), before);
+  }
+});
+test('Recurring customers are reused and repeated saves do not inflate invoice counts', () => {
+  const w = workspaceFixture();
+  rememberCustomer(w, w.job); rememberCustomer(w, w.job);
+  equal(w.customers.length, 1); equal(w.customers[0].invoiceIds.length, 1);
+  const next = structuredClone(w.job); next.id = 'job2'; next.customer.address = 'Updated billing address';
+  rememberCustomer(w, next);
+  equal(w.customers.length, 1); equal(w.customers[0].invoiceIds.length, 2);
+  equal(w.customers[0].address, 'Updated billing address');
+});
+test('Service descriptions can be hidden without changing pricing', () => {
+  const w = workspaceFixture();
+  const before = calculate(w.job, w.printers, w.filaments).total;
+  equal(processingDescriptions(w.job), ['Pre-processing: Slicing and setup.', 'Post-processing: Support removal.']);
+  equal(invoiceCSV(w.job, calculate(w.job, w.printers, w.filaments)).includes('Pre-processing:'), true);
+  w.job.sections.processing = false;
+  equal(processingDescriptions(w.job), []);
+  equal(invoiceCSV(w.job, calculate(w.job, w.printers, w.filaments)).includes('Pre-processing:'), false);
+  equal(calculate(w.job, w.printers, w.filaments).total, before);
+});
+const resinPrinter = { ...printers[0], id: 'rp', technology: 'resin', watts: 60,
+  fepPerPlate: 0.2, ipaPerPlate: 0.3, ppePerPlate: 0.1, lcdPerHour: 0.25, washWatts: 50, cureWatts: 100 };
+const resin = { id: 'r1', kind: 'resin', price: 40, bottleVolume: 1000, wastePercent: 10 };
+const resinPlate = { ...plate, printerId: 'rp', filamentId: 'r1', technology: 'resin', grams: 0, volumeMl: 50, washMinutes: 6, cureMinutes: 12 };
+test('Resin quantity scales volume, residue, consumables, light-source wear and wash/cure energy', () => {
+  const t = calculate({ ...job, plates: [resinPlate] }, [resinPrinter], [resin]);
+  near(t.volumeMl, 100); near(t.grams, 0); near(t.material, 4.4); near(t.consumables, 2.2);
+  near(t.electricity, 0.087); near(t.machine, 6); near(t.labour, 20); near(t.total, 69.62);
+  near(t.lines[0].amount + t.serviceAmount + t.shipping, t.subtotal);
+});
+test('Mixed FDM and resin plates keep separate material units and printer queues', () => {
+  const t = calculate({ ...job, plates: [plate, resinPlate] }, [...printers, resinPrinter], [...filaments, resin]);
+  near(t.grams, 200); near(t.volumeMl, 100); near(t.hours, 8); near(t.elapsed, 4);
+});
+test('Incompatible technologies and invalid resin reserves are rejected', () => {
+  for (const [plates, ps, fs] of [
+    [[resinPlate], [printers[0], resinPrinter], [filaments[0]]],
+    [[{ ...resinPlate, technology: 'fdm' }], [resinPrinter], [resin]],
+    [[resinPlate], [{ ...resinPrinter, fepPerPlate: -1 }], [resin]],
+    [[resinPlate], [resinPrinter], [{ ...resin, bottleVolume: 0 }]],
+  ]) {
+    let threw = false; try { calculate({ ...job, plates }, ps, fs); } catch { threw = true; }
+    equal(threw, true);
+  }
+});
+test('Hourly and fixed modelling fees are added once, without print markup or failure reserve', () => {
+  const base = calculate(job, printers, filaments);
+  const modelling = { enabled: true, mode: 'hourly', hours: 2.5, rate: 50, fixedFee: 99, description: 'CAD and two revisions' };
+  const hourly = calculate({ ...job, modelling }, printers, filaments);
+  near(hourly.modelling, 125); near(hourly.subtotal - base.subtotal, 125);
+  near(hourly.failure, base.failure); near(hourly.markup, base.markup);
+  near(hourly.total, 201.83);
+  const fixedJob = { ...job, modelling: { ...modelling, mode: 'fixed' } };
+  const fixed = calculate(fixedJob, printers, filaments);
+  near(fixed.modelling, 99); near(fixed.subtotal - base.subtotal, 99);
+  equal(invoiceCSV(fixedJob, fixed).includes('CAD and two revisions'), true);
+  near(calculate({ ...job, modelling: { ...modelling, enabled: false } }, printers, filaments).total, base.total);
+});
+test('Currency precision is shared by invoice line rounding, GST and CSV', () => {
+  const jpy = { ...job, currency: 'JPY', plates: [], prepMinutes: 0, finishMinutes: 0, packaging: 45, other: 0, markup: 0, shipping: 0 };
+  const t = calculate(jpy, printers, filaments);
+  equal(currencyDigits('JPY'), 0); near(t.subtotal, 45); near(t.tax, 5); near(t.total, 50);
+  equal(invoiceCSV(jpy, t).includes('"Total JPY","","50"'), true);
+  equal(money(t.total, 'JPY').includes('.00'), false);
+  equal(invoiceCSV({ ...job, currency: 'EUR' }, calculate({ ...job, currency: 'EUR' }, printers, filaments)).includes('Amount (EUR)'), true);
+  const half = calculate({ ...job, shipping: 1.005 }, printers, filaments);
+  near(half.shipping, 1.01);
+  equal(invoiceCSV({ ...job, shipping: 1.005 }, half).includes('"Shipping","","1.01"'), true);
+});
+test('Favourites sort first without changing the saved collection order', () => {
+  const items = [{ name: 'Z resin', favourite: true }, { name: 'A filament' }, { name: 'B printer', favourite: true }];
+  const before = JSON.stringify(items);
+  equal(favouritesFirst(items).map(item => item.name), ['B printer', 'Z resin', 'A filament']);
+  equal(JSON.stringify(items), before);
+});
+test('Hex colours accept three or six digits with or without a hash', () => {
+  equal(['#ABC', 'abcdef', '#12Ab90', ' abc '].map(normalizeHex), ['#aabbcc', '#abcdef', '#12ab90', '#aabbcc']);
+  for (const input of ['#12', '#1234567', 'red', '#gggggg', '12345z']) equal(normalizeHex(input), null);
+});
+test('New service descriptions include other costs and respect the visibility toggle', () => {
+  const described = { ...job, prepDescription: 'Slicing', finishDescription: 'Sanding', otherDescription: 'Magnets and inserts', sections: { processing: true } };
+  equal(processingDescriptions(described), ['Pre-processing: Slicing', 'Post-processing: Sanding', 'Other job costs: Magnets and inserts']);
+  equal(invoiceCSV(described, calculate(described, printers, filaments)).includes('Other job costs: Magnets and inserts'), true);
+  equal(processingDescriptions({ ...described, other: 0 }).length, 2);
+  equal(processingDescriptions({ ...described, sections: { processing: false } }), []);
+});
+test('Version-2 backups migrate currency, materials and layouts while keeping explicit invoice toggles', () => {
+  const old = workspaceFixture(2); old.job.sections.processing = false;
+  const migrated = readWorkspace({ format: 'layer-workspace', schemaVersion: 2, state: old });
+  equal(migrated.version, 3); equal(migrated.job.currency, 'AUD'); equal(migrated.studio.currency, 'AUD');
+  equal(migrated.printers[0].technology, 'fdm'); equal(migrated.filaments[0].kind, 'filament');
+  equal(migrated.job.sections.processing, false); equal(migrated.job.modelling.enabled, false);
+  equal(migrated.settings.libraryViews, { customers: 'list', printers: 'grid', filaments: 'grid' });
+});
+test('Resin, modelling, currency, favourites and library layouts survive backups independently of saved snapshots', () => {
+  const w = readWorkspace(workspaceFixture());
+  w.printers.push({ ...w.printers[0], ...resinPrinter, name: 'Resin printer', favourite: true });
+  w.filaments.push({ ...resin, name: 'Tough resin', brand: 'Test', color: '#123456', colorName: 'Grey', favourite: true });
+  w.job.plates.push({ ...resinPlate, id: 'resin-plate', detail: 'Manual entry', verified: true });
+  w.job.currency = 'EUR'; w.studio.currency = 'USD';
+  w.job.modelling = { enabled: true, mode: 'fixed', hours: 2, rate: 50, fixedFee: 95, description: 'CAD revisions' };
+  w.settings.libraryViews = { customers: 'grid', printers: 'list', filaments: 'list' };
+  const backup = workspaceBackup(w);
+  equal(backup.schemaVersion, 3);
+  const restored = readWorkspace(JSON.parse(JSON.stringify(backup)));
+  equal(restored, readWorkspace(w)); equal(restored.saved[0].job.currency, 'AUD');
+  equal(restored.job.currency, 'EUR'); equal(restored.filaments.at(-1).favourite, true);
+});
+test('Resin preset identity retains technology without inventing costs', () => {
+  equal(parsePrinterPresets('printer_settings_id = "My resin printer"\nprinter_model = SL1S\nprinter_technology = SLA', 'resin.ini')[0].technology, 'resin');
+  equal(printerCatalogue.filter(item => item.technology === 'resin').length >= 5, true);
+});
+window.testResults = results;
+document.querySelector('#results').textContent = results.map(result => `${result.passed ? 'PASS' : 'FAIL'} ${result.name}${result.error ? ': ' + result.error : ''}`).join('\n') + `\n\n${results.filter(result => result.passed).length}/${results.length} passed`;
+</script>
+</body>
+</html>
