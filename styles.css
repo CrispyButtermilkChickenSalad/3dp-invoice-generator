@@ -172,6 +172,11 @@ main { max-width: 1540px; margin: auto; padding: 30px 32px 48px; }
 .plate-assignments .icon { width: 17px; height: 17px; color: var(--muted); }
 .plate-assignments select { width: 100%; min-width: 0; padding: 8px 0; border: 0; font-size: 14px; background: var(--input); color: var(--text); }
 .filament-dot { width: 11px; height: 11px; border-radius: 50%; border: 1px solid var(--muted); flex-shrink: 0; }
+.resin-source { display: grid; justify-items: start; gap: 8px; margin-top: 12px; font-size: 13px; color: var(--muted); }
+.resin-source .text-button { text-align: left; }
+.consent { display: flex; align-items: flex-start; gap: 10px; font-size: 15px; }
+.consent input { flex-shrink: 0; margin-top: 5px; }
+#reconstruction-progress { display: block; width: 100%; margin-top: 24px; }
 .section-foot { display: flex; align-items: flex-start; gap: 7px; margin-top: 16px; font-size: 13px; color: var(--muted); }
 .section-foot .icon { width: 15px; height: 15px; margin-top: 2px; }
 .field-grid { display: grid; gap: 16px; }

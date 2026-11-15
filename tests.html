@@ -6,7 +6,9 @@
 <pre id="results">Running…</pre>
 <script type="module">
 import { calculate, parseGcode, invoiceCSV, duration, processingDescriptions, money, currencyDigits, favouritesFirst, normalizeHex } from './core.js';
-import { printerCatalogue, parsePrinterPresets, readWorkspace, workspaceBackup, rememberCustomer } from './profiles.js';
+import { printerCatalogue, parsePrinterPresets, readWorkspace, workspaceBackup, rememberCustomer, removeProfile } from './profiles.js';
+import { inspectResin, reconstructResin, reconstructionGeometry, ctbCoverage, resinFileAccept, crc32 } from './resin.js';
+import { ctbFixture, gooFixture, sl1Fixture, zipFixture, anycubicFixture, anycubicZipFixture, photonFixture, photonSFixture } from './resin-fixtures.js';
 const results = [];
 function test(name, fn) {
   try { fn(); results.push({ name, passed: true }); }
@@ -14,6 +16,14 @@ function test(name, fn) {
 }
 function equal(actual, expected) { if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`); }
 function near(actual, expected) { if (Math.abs(actual - expected) > 0.00001) throw new Error(`${actual} !== ${expected}`); }
+async function asyncTest(name, fn) {
+  try { await fn(); results.push({ name, passed: true }); }
+  catch (error) { results.push({ name, passed: false, error: error.message }); }
+}
+async function rejects(fn, pattern) {
+  try { await fn(); } catch (error) { if (pattern.test(error.message)) return; throw error; }
+  throw new Error('Expected failure.');
+}
 const printers = [{ id: 'p1', watts: 100, price: 1000, lifetime: 1000, maintenance: 0.5 }, { id: 'p2', watts: 200, price: 2000, lifetime: 1000, maintenance: 1 }];
 const filaments = [{ id: 'f1', price: 20, spoolWeight: 1000 }];
 const plate = { id: 'a', name: 'Test', hours: 2, grams: 100, quantity: 2, printerId: 'p1', filamentId: 'f1' };
@@ -265,6 +275,186 @@ test('Resin, modelling, currency, favourites and library layouts survive backups
 test('Resin preset identity retains technology without inventing costs', () => {
   equal(parsePrinterPresets('printer_settings_id = "My resin printer"\nprinter_model = SL1S\nprinter_technology = SLA', 'resin.ini')[0].technology, 'resin');
   equal(printerCatalogue.filter(item => item.technology === 'resin').length >= 5, true);
+});
+await asyncTest('CTB v2/v3 use slicer volume, time and identity without reading layer payloads', async () => {
+  for (const version of [2, 3]) {
+    const file = ctbFixture({ version }), reads = [];
+    const source = { name: file.name, size: file.size, slice(start, end) { reads.push([start, end]); return file.slice(start, end); } };
+    const metrics = await inspectResin(source);
+    near(metrics.hours, 1); near(metrics.volumeMl, 12.5); equal(metrics.printerName, 'Test resin printer');
+    equal(metrics.reconstruction, version === 2 ? 'ctb2' : null);
+    equal(reads.some(([start, end]) => start >= 512 || end > 512), false);
+  }
+});
+await asyncTest('GOO reads bounded metadata and converts cubic millimetres to mL', async () => {
+  const file = gooFixture(), reads = [];
+  const metrics = await inspectResin({ name: file.name, size: file.size, slice(start, end) { reads.push(end - start); return file.slice(start, end); } });
+  near(metrics.hours, 1.5); near(metrics.volumeMl, 12.5); equal(metrics.geometry.pixelsX, 4098);
+  equal(metrics.printerName, 'Test GOO printer'); equal(metrics.reconstruction, null);
+  equal(reads.reduce((sum, size) => sum + size, 0) < 400, true);
+  const missing = await inspectResin(gooFixture({ volume: 0, time: 0 }));
+  equal(missing.hours, null); equal(missing.volumeMl, null);
+});
+await asyncTest('SL1 and SL1S stored/deflated archives import config metrics without decoding PNGs', async () => {
+  for (const compressed of [false, true]) {
+    const file = await zipFixture({ 'config.ini': 'printTime = 7200\nusedMaterial = 1.25\nprinterModel = SL1S\nlayerHeight = 0.05', 'layer00000.png': new Uint8Array([0]) }, 'test.sl1s', compressed);
+    const metrics = await inspectResin(file);
+    near(metrics.hours, 2); near(metrics.volumeMl, 1.25); equal(metrics.layers, 1); equal(metrics.format, 'SL1S');
+    equal(metrics.geometry.widthMm, null);
+  }
+  const missing = await inspectResin(await sl1Fixture({ volume: 0, time: 0 }));
+  equal(missing.hours, null); equal(missing.volumeMl, null);
+});
+await asyncTest('CTB reconstruction uses grayscale coverage and actual per-layer heights', async () => {
+  const file = ctbFixture({ volume: 0 }), info = await inspectResin(file), progress = [];
+  near(await reconstructResin(file, { ...info.geometry, firstLayerHeightMm: 0.05 }, value => progress.push(value)), 0.25);
+  equal(progress, [50, 100]);
+  const variable = new Uint8Array(await file.arrayBuffer());
+  new DataView(variable.buffer).setFloat32(548, 0.15, true);
+  near(await reconstructResin(new File([variable], 'variable.ctb'), { ...info.geometry, firstLayerHeightMm: 0.05 }), 0.375);
+  near(ctbCoverage(new Uint8Array([64, 127]), 2), 64 / 127 + 1);
+  near(ctbCoverage(new Uint8Array([255, 0x80, 0x82]), 130), 130);
+});
+await asyncTest('SL1 reconstruction weights anti-aliasing and the confirmed first-layer height', async () => {
+  const file = await sl1Fixture({ volume: 0, images: true, compressed: true }), info = await inspectResin(file);
+  near(await reconstructResin(file, { ...info.geometry, firstLayerHeightMm: 0.05 }), (2 + 128 / 255) / 4 * 200 * 0.05 / 1000 + 0.01);
+  near(await reconstructResin(file, { ...info.geometry, firstLayerHeightMm: 0.1 }), (2 + 128 / 255) / 4 * 200 * 0.1 / 1000 + 0.01);
+});
+await asyncTest('Unsupported versions/encryption never advertise unavailable reconstruction', async () => {
+  await rejects(() => inspectResin(ctbFixture({ version: 4 })), /v2\/v3/);
+  await rejects(() => inspectResin(gooFixture({ version: 'V4.0' })), /V3.0/);
+  const encrypted = ctbFixture({ encrypted: true, volume: 0 }), info = await inspectResin(encrypted);
+  near(info.hours, 1); equal(info.reconstruction, null); equal(info.volumeMl, null);
+  await rejects(() => reconstructResin(encrypted, {}), /unencrypted CTB/);
+  await rejects(() => reconstructResin(gooFixture({ volume: 0 }), {}), /not supported/);
+});
+await asyncTest('Corrupt offsets, truncation, runs, checksums and unsafe geometry fail explicitly', async () => {
+  const file = ctbFixture(), raw = new Uint8Array(await file.arrayBuffer());
+  new DataView(raw.buffer).setFloat32(8, 1e-30, true);
+  equal((await inspectResin(new File([raw], 'tiny.ctb'))).geometry.widthMm, null);
+  new DataView(raw.buffer).setUint32(64, 1000, true);
+  await rejects(() => inspectResin(new File([raw], 'bad.ctb')), /layer table bounds/);
+  await rejects(() => inspectResin(new File([new Uint8Array(30)], 'bad.ctb')), /Truncated/);
+  const corrupt = ctbFixture({ corruptRun: true }), info = await inspectResin(corrupt);
+  await rejects(() => reconstructResin(corrupt, { ...info.geometry, firstLayerHeightMm: 0.05 }), /exceed/);
+  await rejects(() => ctbCoverage(new Uint8Array([255]), 4), /Truncated/);
+  await rejects(() => ctbCoverage(new Uint8Array([1]), 4), /does not fill/);
+  await rejects(() => reconstructionGeometry({}), /valid display/);
+  await rejects(() => reconstructionGeometry({ widthMm: 10, heightMm: 20, pixelsX: 10000, pixelsY: 10000, layerHeightMm: 0.05 }), /40 million/);
+  const zip = new Uint8Array(await (await sl1Fixture()).arrayBuffer());
+  zip[40] ^= 1;
+  await rejects(() => inspectResin(new File([zip], 'bad.sl1')), /checksum/);
+  await rejects(() => inspectResin(new File([zip.slice(0, -2)], 'bad.sl1')), /complete ZIP/);
+  await rejects(async () => inspectResin(await zipFixture({ 'other.ini': 'test' })), /missing config/);
+});
+await asyncTest('Verified Prusa resin presets preserve optional display geometry', async () => {
+  const preset = parsePrinterPresets('printer_settings_id = Test\nprinter_technology = SLA\ndisplay_width = 120\ndisplay_height = 68\ndisplay_pixels_x = 2560\ndisplay_pixels_y = 1440', 'printer.ini')[0];
+  equal(preset.geometry, { widthMm: 120, heightMm: 68, pixelsX: 2560, pixelsY: 1440 });
+});
+await asyncTest('Resin provenance and printer geometry survive backup validation and CSV export', async () => {
+  const w = readWorkspace(workspaceFixture()), file = ctbFixture(), info = await inspectResin(file);
+  w.printers.push({ ...w.printers[0], ...resinPrinter, geometry: { widthMm: 100, heightMm: 50, pixelsX: 2, pixelsY: 2 } });
+  w.filaments.push({ ...resin, name: 'Test resin', brand: 'Test', color: '#123456', colorName: 'Grey', favourite: false });
+  w.job.plates.push({ ...resinPlate, id: 'imported-resin', detail: 'test.ctb', verified: true,
+    resinImport: { ...info, volumeSource: 'reconstructed', hoursSource: 'slicer', firstLayerHeightMm: 0.05, fileSize: file.size } });
+  const restored = readWorkspace(JSON.parse(JSON.stringify(workspaceBackup(w))));
+  equal(restored.job.plates.at(-1).resinImport.volumeSource, 'reconstructed');
+  equal(restored.printers.at(-1).geometry, w.printers.at(-1).geometry);
+  equal(invoiceCSV(restored.job, calculate(restored.job, restored.printers, restored.filaments)).includes('potentially inaccurate'), true);
+  const invalid = structuredClone(restored); invalid.job.plates.at(-1).resinImport.volumeSource = 'trusted';
+  await rejects(() => readWorkspace(invalid), /Invalid resin metric/);
+});
+await asyncTest('Profile removal blocks active assignments without changing the workspace', async () => {
+  const w = readWorkspace(workspaceFixture()), before = JSON.stringify(w);
+  await rejects(() => removeProfile(w, 'printer', w.job.plates[0].printerId), /Reassign or remove/);
+  await rejects(() => removeProfile(w, 'filament', w.job.plates[0].filamentId), /Reassign or remove/);
+  await rejects(() => removeProfile(w, 'printer', 'missing'), /no longer exists/);
+  equal(JSON.stringify(w), before);
+});
+test('Unassigned printer, filament and resin removal preserves saved invoices and supports empty libraries', () => {
+  const w = readWorkspace(workspaceFixture()), saved = JSON.stringify(w.saved);
+  w.job.plates = [];
+  w.filaments.push({ ...w.filaments[0], id: 'resin-remove', kind: 'resin', bottleVolume: 1000, wastePercent: 0 });
+  removeProfile(w, 'filament', 'resin-remove');
+  for (const profile of [...w.printers]) removeProfile(w, 'printer', profile.id);
+  for (const profile of [...w.filaments]) removeProfile(w, 'filament', profile.id);
+  equal(w.printers, []); equal(w.filaments, []); equal(JSON.stringify(w.saved), saved);
+  const restored = readWorkspace(JSON.parse(JSON.stringify(workspaceBackup(w))));
+  equal(restored.printers, []); equal(restored.filaments, []);
+  equal(JSON.stringify(restored.saved), saved);
+  const opened = readWorkspace({ ...restored, ...structuredClone(restored.saved[0]) });
+  equal(opened.printers.length, 2); equal(opened.filaments.length, 1);
+});
+await asyncTest('All 22 UVtools Photon Workshop binary extensions route to bounded metadata inspection', async () => {
+  const extensions = ['pws', 'pw0', 'pwx', 'dlp', 'dl2p', 'pwmx', 'pmx2', 'pwmb', 'px6s', 'pwmo', 'pm3n', 'pm4n', 'pwms', 'pwma', 'pmsq', 'pm3', 'pm3m', 'pm3r', 'pm5', 'pm5s', 'm5sp', 'pwc'];
+  for (const extension of extensions) {
+    const file = anycubicFixture({ extension }), reads = [];
+    const metadata = await inspectResin({ name: file.name.toUpperCase(), size: file.size, slice(start, end) { reads.push([start, end]); return file.slice(start, end); } });
+    equal(resinFileAccept.split(',').includes(`.${extension}`), true);
+    near(metadata.hours, 1.5); near(metadata.volumeMl, 12.5);
+    equal(metadata.format, 'Anycubic v518'); equal(metadata.layers, 2);
+    equal(metadata.printerName, 'Anycubic Photon Mono M5s Pro'); equal(metadata.reconstruction, null);
+    near(metadata.geometry.widthMm, 223.6416); near(metadata.geometry.heightMm, 126.976);
+    equal(reads.some(([start, end]) => start >= 532 || end > 532), false);
+  }
+});
+await asyncTest('Photon Workshop binary versions 1, 515, 516, 517 and 518 preserve available metadata', async () => {
+  for (const version of [1, 515, 516, 517, 518]) {
+    const metadata = await inspectResin(anycubicFixture({ version }));
+    near(metadata.hours, 1.5); near(metadata.volumeMl, 12.5); equal(metadata.format, `Anycubic v${version}`);
+    equal(metadata.geometry.widthMm === null, version < 516);
+  }
+  const missing = await inspectResin(anycubicFixture({ time: 0, volume: NaN }));
+  equal(missing.hours, null); equal(missing.volumeMl, null);
+});
+await asyncTest('All six Photon Workshop ZIP extensions use metadata without decoding images or resin bottle capacity', async () => {
+  for (const extension of ['pm4u', 'pm7', 'pm7m', 'pwsz', 'pp1', 'pp1m']) {
+    const metadata = await inspectResin(await anycubicZipFixture({ extension }));
+    near(metadata.hours, 2); near(metadata.volumeMl, 25.75); equal(metadata.layers, 2);
+    equal(metadata.geometry.pixelsX, 13312); near(metadata.firstLayerHeightMm, 0.1);
+    equal(metadata.reconstruction, null); equal(metadata.printerName, 'Anycubic Photon Mono M7 Pro');
+    equal(resinFileAccept.split(',').includes(`.${extension}`), true);
+  }
+  const missing = await inspectResin(await anycubicZipFixture({ missingInfo: true }));
+  equal(missing.hours, null); equal(missing.volumeMl, null);
+  for (const version of ['1', '2']) {
+    const older = await inspectResin(await anycubicZipFixture({ version }));
+    equal(older.format, `Anycubic ZIP v${version}`); near(older.volumeMl, 25.75);
+  }
+});
+await asyncTest('Legacy Photon and PhotonS import only stored metrics, never invented total time', async () => {
+  for (const version of [1, 2]) {
+    const metadata = await inspectResin(await photonFixture(version));
+    near(metadata.hours, 1); equal(metadata.volumeMl, version === 1 ? null : 12.5);
+    equal(metadata.reconstruction, null);
+  }
+  const metadata = await inspectResin(photonSFixture());
+  near(metadata.volumeMl, 15.5); equal(metadata.hours, null); equal(metadata.layers, 2);
+  equal(metadata.geometry.pixelsX, 1440); near(metadata.geometry.widthMm, 68.04);
+});
+await asyncTest('Anycubic corruption and unknown versions fail before pricing or reconstruction', async () => {
+  await rejects(() => inspectResin(anycubicFixture({ version: 519 })), /Unsupported Photon Workshop version/);
+  const raw = new Uint8Array(await anycubicFixture().arrayBuffer()), data = new DataView(raw.buffer);
+  data.setUint32(20, 1020, true);
+  await rejects(() => inspectResin(new File([raw], 'bad.m5sp')), /Truncated/);
+  data.setUint32(20, 128, true); raw[128] = 0;
+  await rejects(() => inspectResin(new File([raw], 'bad.m5sp')), /section marker/);
+  await rejects(async () => inspectResin(await anycubicZipFixture({ version: '99' })), /settings version/);
+  await rejects(async () => inspectResin(await zipFixture({ 'anycubic_photon_resins.pwsp': '{' }, 'bad.pwsz')), /Cannot read/);
+  await rejects(async () => inspectResin(await zipFixture({ 'config.ini': 'usedMaterial = 1' }, 'renamed.pwsz')), /missing/);
+  await rejects(() => reconstructResin(anycubicFixture(), {}), /not implemented/);
+  equal(crc32(new TextEncoder().encode('123456789')), 0xcbf43926);
+});
+await asyncTest('Anycubic metadata survives backups and feeds resin pricing from the uploaded volume', async () => {
+  const w = readWorkspace(workspaceFixture()), file = anycubicFixture(), info = await inspectResin(file);
+  w.printers.push({ ...w.printers[0], ...resinPrinter });
+  w.filaments.push({ ...resin, name: 'Test resin', brand: 'Test', color: '#123456', colorName: 'Grey' });
+  w.job.plates = [{ ...resinPlate, id: 'm5sp', volumeMl: info.volumeMl, hours: info.hours, quantity: 1, detail: file.name, verified: true,
+    resinImport: { ...info, volumeSource: 'slicer', hoursSource: 'slicer', firstLayerHeightMm: null, fileSize: file.size } }];
+  const restored = readWorkspace(JSON.parse(JSON.stringify(workspaceBackup(w))));
+  const totals = calculate(restored.job, restored.printers, restored.filaments);
+  near(totals.volumeMl, 12.5); near(totals.hours, 1.5);
+  equal(restored.job.plates[0].resinImport.format, 'Anycubic v518');
 });
 window.testResults = results;
 document.querySelector('#results').textContent = results.map(result => `${result.passed ? 'PASS' : 'FAIL'} ${result.name}${result.error ? ': ' + result.error : ''}`).join('\n') + `\n\n${results.filter(result => result.passed).length}/${results.length} passed`;

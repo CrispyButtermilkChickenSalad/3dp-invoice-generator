@@ -1,5 +1,6 @@
-import { money as formatMoney, uid, escapeHTML as e, duration, calculate, parseGcode, invoiceCSV, processingDescriptions, currencies, printerTechnology, materialKind, favouritesFirst, normalizeHex } from './core.js';
-import { printerCatalogue, parsePrinterPresets, readWorkspace, workspaceBackup, rememberCustomer } from './profiles.js';
+import { money as formatMoney, uid, escapeHTML as e, duration, calculate, parseGcode, invoiceCSV, processingDescriptions, currencies, printerTechnology, materialKind, favouritesFirst, normalizeHex, resinEstimateNote } from './core.js';
+import { printerCatalogue, parsePrinterPresets, readWorkspace, workspaceBackup, rememberCustomer, removeProfile } from './profiles.js';
+import { inspectResin, resinExtensions, resinFileAccept, reconstructionGeometry } from './resin.js';
 
 const icons = {
   layers: '<path d="m3 7 9-5 9 5-9 5zM3 12l9 5 9-5M3 17l9 5 9-5"/>',
@@ -69,6 +70,8 @@ let toastTimer;
 let lastFocus;
 let pricingTab = 'printing';
 const searches = { printers: '', filaments: '', customers: '' };
+const resinFiles = new Map();
+let reconstruction = null;
 const root = document.querySelector('#app');
 const modalRoot = document.querySelector('#modal-root');
 const totals = () => calculate(state.job, state.printers, state.filaments);
@@ -133,9 +136,9 @@ function invoiceWorkspace() {
 }
 function platesEditor(t) {
   return `<section class="card plates-card"><div class="section-heading"><h2>Plates <span class="count-pill">${state.job.plates.length}</span></h2><button class="text-button" data-action="plate">${icon('plus')} Add manually</button></div>
-    <label class="upload-area ${importing ? 'busy' : ''}" id="drop-zone"><input id="gcode-upload" type="file" accept=".gcode,.gco,.g" multiple ${importing ? 'disabled' : ''}><div class="upload-symbol">${icon('upload')}</div><div><strong>${importing ? 'Reading your plates…' : 'Drop your G-code files here'} <span>or browse files</span></strong><p>Print time & filament, filled in automatically</p></div><span class="file-badge">.gcode</span></label>
+    <label class="upload-area ${importing ? 'busy' : ''}" id="drop-zone"><input id="gcode-upload" type="file" accept=".gcode,.gco,.g,${resinFileAccept}" multiple ${importing ? 'disabled' : ''}><div class="upload-symbol">${icon('upload')}</div><div><strong>${importing ? 'Reading plate metadata…' : 'Drop sliced print files here'} <span>or browse files</span></strong><p>G-code, Photon Workshop / Anycubic, SL1/SL1S, GOO and CTB</p></div></label>
     <div class="plate-list">${state.job.plates.length ? state.job.plates.map((plate, index) => plateCard(plate, index, t.lines[index])).join('') : '<div class="empty-state">Upload G-code or add a plate manually.</div>'}</div>
-    <div class="section-foot">${icon('info')} Plain-text PrusaSlicer, OrcaSlicer, Bambu Studio & Cura metadata supported.</div></section>
+    <div class="section-foot">${icon('info')} Resin imports are version-limited. Missing metrics can be copied from your slicer; optional reconstruction is potentially inaccurate. Each plate prices one assigned resin; split multi-resin jobs by material.</div></section>
     <section class="card pricing-card"><div class="section-heading"><h2>Labour & pricing</h2></div>
     <div class="field-grid three">${field('Pre-processing', 'job.prepMinutes', state.job.prepMinutes, { type: 'number', suffix: 'min', hint: 'Model checks, slicing and setup.' })}${field('Post-processing', 'job.finishMinutes', state.job.finishMinutes, { type: 'number', suffix: 'min', hint: 'Supports, cleanup and finishing.' })}${field('Hourly rate', 'job.labourRate', state.job.labourRate, { type: 'number', suffix: '$ / hr' })}</div>
     <div class="field-grid two spaced">${field('Pre-processing description', 'job.prepDescription', state.job.prepDescription, { maxLength: 1000 })}${field('Post-processing description', 'job.finishDescription', state.job.finishDescription, { maxLength: 1000 })}</div>
@@ -160,7 +163,8 @@ function plateCard(plate, index, line) {
   return `<article class="plate"><div class="plate-visual visual-${index % 3}"><div class="print-object"><i></i><i></i><i></i></div><span>PLATE ${String(index + 1).padStart(2, '0')}</span></div>
     <div class="plate-content"><div class="plate-title"><div><h3>${e(plate.name)}</h3><span>${e(plate.detail || 'Manual entry')}</span></div><div class="plate-actions"><button class="icon-button" data-action="edit-plate" data-id="${plate.id}" aria-label="Edit ${e(plate.name)}">${icon('edit')}</button><button class="icon-button delete" data-action="remove-plate" data-id="${plate.id}" aria-label="Remove ${e(plate.name)}">${icon('close')}</button></div></div>
     <div class="plate-metrics"><span>${line.technology === 'resin' ? 'Resin' : 'FDM'}</span><span>${icon('clock')} ${duration(plate.hours)}</span><span>${icon('spool')} ${line.technology === 'resin' ? `${plate.volumeMl.toFixed(1)} mL` : `${plate.grams.toFixed(1)} g`}</span><span>× ${plate.quantity} plate${plate.quantity !== 1 ? 's' : ''}</span>${!plate.verified ? '<span class="warning-tag">Review metrics</span>' : ''}</div>
-    <div class="plate-assignments"><label>${icon('printer')}<select name="plate.${plate.id}.printerId" aria-label="Printer for ${e(plate.name)}">${options(compatiblePrinters(line.technology), plate.printerId, favouriteLabel)}</select></label><label><i class="filament-dot" style="background:${e(line.filament.color)}"></i><select name="plate.${plate.id}.filamentId" aria-label="Material for ${e(plate.name)}">${options(compatibleMaterials(line.technology), plate.filamentId, filament => `${favouriteLabel(filament)} · ${filament.colorName}`)}</select></label></div></div></article>`;
+    <div class="plate-assignments"><label>${icon('printer')}<select name="plate.${plate.id}.printerId" aria-label="Printer for ${e(plate.name)}">${options(compatiblePrinters(line.technology), plate.printerId, favouriteLabel)}</select></label><label><i class="filament-dot" style="background:${e(line.filament.color)}"></i><select name="plate.${plate.id}.filamentId" aria-label="Material for ${e(plate.name)}">${options(compatibleMaterials(line.technology), plate.filamentId, filament => `${favouriteLabel(filament)} · ${filament.colorName}`)}</select></label></div>
+    ${plate.resinImport ? `<div class="resin-source"><span>${e(plate.resinImport.format)} · Volume: ${e(plate.resinImport.volumeSource)} · Time: ${e(plate.resinImport.hoursSource)}</span>${plate.resinImport.volumeSource === 'reconstructed' ? '<strong class="warning-tag">Potentially inaccurate reconstructed volume</strong>' : ''}<button class="text-button" data-action="resin-options" data-id="${plate.id}">${plate.volumeMl > 0 && plate.hours > 0 ? 'Import details' : 'Missing metrics: slicer or reconstruction'}</button></div>` : ''}</div></article>`;
 }
 function summary(t) {
   const count = Object.keys(t.schedules).length;
@@ -201,7 +205,7 @@ function profiles(type) {
   const isPrinter = type === 'printer';
   const key = isPrinter ? 'printers' : 'filaments';
   return `<section class="page-heading"><h1>${isPrinter ? 'Printers' : 'Filaments & resins'}</h1><div class="button-row"><button class="button primary" data-action="add-${type}">${icon('plus')} Add ${type}</button>${!isPrinter ? '<button class="button secondary" data-action="add-resin">Add resin</button>' : ''}</div></section>
-    ${isPrinter ? '<p class="helper spaced-bottom">Add a printer from the catalogue, import a slicer preset, or enter details manually. Set your own operating costs.</p>' : ''}
+    ${isPrinter ? '<p class="helper spaced-bottom">Add a printer from the catalogue, import a slicer preset, or enter details manually. Set your own operating costs. A profile does not add support for new sliced-file formats.</p>' : ''}
     ${libraryControls(key, isPrinter ? 'printers' : 'filaments and resins')}<div id="${key}-results">${profileList(type)}</div>
     <p class="helper">${isPrinter ? 'Depreciation = purchase price ÷ usable print hours. Keep FEP/LCD reserves separate from general maintenance to avoid double counting.' : 'Filament is priced by weight; resin by bottle volume. Residue allowance covers resin handling losses, not failed reprints.'} Prices use ${state.job.currency}; changes affect the current project, not saved snapshots.</p>`;
 }
@@ -213,12 +217,12 @@ function profileList(type) {
   const key = printer ? 'printers' : 'filaments';
   const query = searches[key].trim().toLowerCase();
   const items = favouritesFirst((printer ? state.printers : state.filaments).filter(item => `${item.name} ${item.model || ''} ${item.brand || ''} ${item.colorName || ''} ${printer ? printerTechnology(item) : materialKind(item)}`.toLowerCase().includes(query)));
-  if (!items.length) return '<div class="empty-state">No matching profiles.</div>';
+  if (!items.length) return `<div class="empty-state">${state[key].length ? 'No matching profiles.' : `No ${printer ? 'printers' : 'filaments or resins'} yet. Add a profile to price plates.`}</div>`;
   return `<div class="profile-grid ${state.settings.libraryViews[key] === 'list' ? 'library-list' : ''}">${items.map(item => {
     const resin = printer ? printerTechnology(item) === 'resin' : materialKind(item) === 'resin';
     const rows = printer ? [['Type', resin ? 'Resin' : 'FDM'], ['Power', `${item.watts} W`], ['Upkeep', `${money(item.maintenance)} / hr`]] :
       [[resin ? 'Bottle price' : 'Spool price', money(item.price)], [resin ? 'Bottle volume' : 'Spool weight', `${resin ? item.bottleVolume : item.spoolWeight} ${resin ? 'mL' : 'g'}`], ['Type', resin ? 'Resin' : 'Filament']];
-    return `<article class="card profile-card"><div class="profile-card-heading"><div><h2>${e(item.name)}</h2><p>${e(printer ? item.model : `${item.brand} · ${item.colorName}`)}</p></div><div class="profile-actions"><button class="icon-button favourite ${item.favourite ? 'is-favourite' : ''}" data-action="favourite" data-type="${type}" data-id="${item.id}" aria-label="Favourite ${e(item.name)}" aria-pressed="${item.favourite}">${icon('star')}</button><button class="icon-button" aria-label="Edit ${e(item.name)}" data-action="edit-${type}" data-id="${item.id}">${icon('edit')}</button></div></div><dl>${rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`).join('')}</dl></article>`;
+    return `<article class="card profile-card"><div class="profile-card-heading"><div><h2>${e(item.name)}</h2><p>${e(printer ? item.model : `${item.brand} · ${item.colorName}`)}</p></div><div class="profile-actions"><button class="icon-button favourite ${item.favourite ? 'is-favourite' : ''}" data-action="favourite" data-type="${type}" data-id="${item.id}" aria-label="Favourite ${e(item.name)}" aria-pressed="${item.favourite}">${icon('star')}</button><button class="icon-button" aria-label="Edit ${e(item.name)}" data-action="edit-${type}" data-id="${item.id}">${icon('edit')}</button><button class="icon-button delete" aria-label="Remove ${e(item.name)}" title="Remove profile" data-action="remove-${type}" data-id="${item.id}">${icon('trash')}</button></div></div><dl>${rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`).join('')}</dl></article>`;
   }).join('')}</div>`;
 }
 function savedView() {
@@ -237,7 +241,7 @@ function dataView() {
   return `<section class="page-heading"><h1>Data & backups</h1></section><div class="data-grid">
     <section class="card"><div class="section-heading"><h2>Browser storage</h2></div><p>Drafts, profiles, customers and theme are saved automatically on this device, including after closing the browser.</p><dl class="storage-details"><div><dt>Storage policy</dt><dd id="persistence-status">${e(persistentStorage)}</dd></div><div><dt>Current site</dt><dd>${e(location.origin + location.pathname)}</dd></div></dl><button class="button secondary" data-action="persistent-storage">Request persistent storage</button><p class="helper">Clearing site data or using a private session can remove data. Browser storage is not a backup. Localhost and GitHub Pages have separate storage.</p></section>
     <section class="card"><div class="section-heading"><h2>JSON backup</h2></div><p>Transfer printers, filaments, resins, customers, saved invoices, the current draft and settings between local hosting and GitHub Pages.</p><div class="button-row spaced"><button class="button primary" data-action="backup-export">${icon('download')} Download backup</button><label class="button secondary file-button">${icon('upload')} Import backup<input id="backup-upload" type="file" accept=".json,application/json"></label></div><p class="helper">Import replaces this browser’s workspace after confirmation. Backups contain customer contact details; store them securely.</p>${storageError ? '<button class="text-button spaced" data-action="raw-backup">Download unreadable stored data</button>' : ''}</section>
-    </div><button class="text-button danger spaced" data-action="reset">Reset all local data…</button>`;
+    </div><p class="helper spaced">Anycubic format research: <a href="https://github.com/sn4k3/UVtools" target="_blank" rel="noopener noreferrer">UVtools by sn4k3 and contributors</a> (AGPL-3.0). Independent metadata readers; the UVtools engine is not bundled. <a href="./THIRD_PARTY_NOTICES.md" target="_blank" rel="noopener noreferrer">Format references & notices</a>.</p><button class="text-button danger spaced" data-action="reset">Reset all local data…</button>`;
 }
 function invoiceHTML() {
   const j = state.job;
@@ -250,7 +254,7 @@ function invoiceHTML() {
     <div class="document-parties"><div><span class="eyebrow">BILL TO</span><h3>${e(j.customer.name || 'Customer name not set')}</h3>${formal && j.customer.company ? `<p>${e(j.customer.company)}</p>` : ''}${j.customer.email ? `<p>${e(j.customer.email)}</p>` : ''}${j.sections.address && j.customer.address ? `<p class="preserve">${e(j.customer.address)}</p>` : ''}${formal && j.customer.abn ? `<p>ABN ${e(j.customer.abn)}</p>` : ''}</div><div><p>Issued <b>${e(j.date)}</b></p>${j.dueDate ? `<p>Due <b>${e(j.dueDate)}</b></p>` : ''}<p>Currency <b>${j.currency}</b></p></div></div>
     <h3 class="document-project">${e(j.name)}</h3>
     <table><thead><tr><th>Description</th><th>Qty</th><th>Amount</th></tr></thead><tbody>
-      ${t.lines.map(line => `<tr><td><strong>${e(line.name)}</strong>${j.sections.metrics ? `<small>${e(line.filament.name)} · ${e(line.filament.colorName)} · ${line.technology === 'resin' ? `${line.volumeMl.toFixed(1)} mL` : `${line.grams.toFixed(1)} g`} · ${duration(line.hours)}</small>` : ''}</td><td>${line.quantity}</td><td>${money(line.amount)}</td></tr>`).join('')}
+      ${t.lines.map(line => `<tr><td><strong>${e(line.name)}</strong>${j.sections.metrics ? `<small>${e(line.filament.name)} · ${e(line.filament.colorName)} · ${line.technology === 'resin' ? `${line.volumeMl.toFixed(1)} mL` : `${line.grams.toFixed(1)} g`} · ${duration(line.hours)}</small>` : ''}${resinEstimateNote(line) ? `<small>${resinEstimateNote(line)}</small>` : ''}</td><td>${line.quantity}</td><td>${money(line.amount)}</td></tr>`).join('')}
       <tr><td><strong>Preparation, finishing & sundries</strong>${processingDescriptions(j).map(text => `<small class="preserve">${e(text)}</small>`).join('')}</td><td>1</td><td>${money(t.serviceAmount)}</td></tr>
       ${j.modelling.enabled ? `<tr><td><strong>3D modelling</strong>${j.modelling.description ? `<small class="preserve">${e(j.modelling.description)}</small>` : ''}</td><td>1</td><td>${money(t.modelling)}</td></tr>` : ''}
       ${j.shipping ? `<tr><td>Shipping</td><td>1</td><td>${money(t.shipping)}</td></tr>` : ''}</tbody></table>
@@ -265,7 +269,10 @@ function showModal(kind, id = null, initial = {}) {
   renderModal();
   modalRoot.querySelector('input:not([type="hidden"]), button')?.focus();
 }
-function closeModal() { modal = null; pendingBackup = null; modalRoot.innerHTML = ''; document.body.classList.remove('modal-open'); lastFocus?.focus(); }
+function closeModal() {
+  if (reconstruction) { reconstruction.worker.terminate(); reconstruction = null; }
+  modal = null; pendingBackup = null; modalRoot.innerHTML = ''; document.body.classList.remove('modal-open'); lastFocus?.focus();
+}
 function renderModal() {
   if (!modal) return;
   let title = '', body = '', footer = '', wide = false;
@@ -274,6 +281,32 @@ function renderModal() {
     title = 'Invoice preview'; wide = true;
     body = `${!state.job.customer.name.trim() || !state.studio.email.trim() || !state.job.plates.length || state.job.plates.some(plate => !plate.verified) ? '<div class="notice warning">Check customer details, studio contact information and flagged print metrics before sending.</div>' : ''}${state.job.taxEnabled && (!state.job.sections.business || !state.studio.abn.trim()) ? '<div class="notice warning">GST requires your studio ABN and business details.</div>' : ''}<div class="document-frame">${invoiceHTML()}</div>`;
     footer = `<button type="button" class="button secondary" data-action="csv">${icon('download')} Export CSV</button><button type="button" class="button primary" data-action="print">${icon('download')} Print / Save PDF</button>`;
+  } else if (kind === 'resin-options') {
+    const plate = state.job.plates.find(item => item.id === id), info = plate.resinImport;
+    const file = resinFiles.get(id), canEstimate = info.reconstruction && (plate.volumeMl <= 0 || info.volumeSource === 'reconstructed');
+    title = 'Resin import & missing metrics';
+    body = `<p>${e(info.format)}${info.printerName ? ` · Slicer printer: ${e(info.printerName)}` : ''}</p>
+      <p class="helper">Volume: ${e(info.volumeSource)}. Print time: ${e(info.hoursSource)}. Slicer estimates can differ from actual usage and runtime. Check the assigned printer and resin.</p>
+      <div class="notice">Recommended: return to your slicer, check total resin including supports and print time, then enter those values.</div>
+      <button type="button" class="button secondary" data-action="slicer-metrics" data-id="${id}">Enter values from slicer</button>
+      ${canEstimate ? `<div class="notice warning">Optional reconstruction is potentially inaccurate. Grayscale/anti-aliasing, screen calibration and layer-height assumptions affect volume. It does not reconstruct print time.</div>
+        ${file ? '' : '<label class="field spaced"><span>Reselect the original sliced file (not stored in backups)</span><input id="resin-reselect" type="file" accept=".sl1,.sl1s,.ctb"></label>'}
+        <button type="button" class="text-button spaced" data-action="profile-geometry" data-id="${id}">Use assigned printer dimensions</button>
+        <p class="helper">Confirm physical display dimensions and pixel resolution, not the model bounding box. SL1 reconstruction assumes uniform layers after the first; CTB uses per-layer Z positions.</p>
+        <div class="field-grid two spaced">${[
+          ['Display width', 'widthMm', 'mm', 0.001, 2000], ['Display height', 'heightMm', 'mm', 0.001, 2000],
+          ['Resolution X', 'pixelsX', 'px', 1, 32768], ['Resolution Y', 'pixelsY', 'px', 1, 32768],
+          ['Normal layer height', 'layerHeightMm', 'mm', 0.000001, 5], ['First layer height', 'firstLayerHeightMm', 'mm', 0.000001, 5],
+        ].map(([label, key, suffix, min, max]) => field(label, key, modal.draft?.[key] ?? (key === 'firstLayerHeightMm' ? info.firstLayerHeightMm ?? info.geometry.layerHeightMm : info.geometry[key]) ?? '', { type: 'number', suffix, min, max, step: key.startsWith('pixels') ? 1 : 'any', required: true })).join('')}</div>
+        <label class="consent"><input name="estimateConsent" type="checkbox" required> I confirm these dimensions/heights and understand the reconstructed volume may be inaccurate.</label>
+        <p id="reconstruction-error" class="helper" role="alert"></p>
+        <button type="button" class="button secondary spaced" data-action="reconstruct" data-id="${id}" ${file ? '' : 'disabled'}>Reconstruct volume estimate</button>` :
+        `<p class="helper">${plate.volumeMl > 0 ? 'Existing volume is used; reconstruction does not replace available slicer or manually entered volume.' : e(info.reason || 'Reconstruction is unavailable. Use values from your slicer.')}</p>`}`;
+    footer = '<button type="button" class="button secondary" data-action="close-modal">Close</button>';
+  } else if (kind === 'reconstructing') {
+    title = 'Reconstructing volume estimate';
+    body = '<p>Reading supported layer images locally. No files are uploaded.</p><progress id="reconstruction-progress" max="100" value="0" aria-label="Reconstruction progress"></progress><p id="reconstruction-status" role="status">0%</p>';
+    footer = '<button type="button" class="button secondary" data-action="close-modal">Cancel reconstruction</button>';
   } else if (kind === 'printer' || kind === 'filament') {
     const printer = kind === 'printer';
     const item = (printer ? state.printers : state.filaments).find(profile => profile.id === id);
@@ -283,13 +316,15 @@ function renderModal() {
         fepPerPlate: 0, ipaPerPlate: 0, ppePerPlate: 0, lcdPerHour: 0, washWatts: 0, cureWatts: 0, ...item, ...modal.draft };
       const resin = p.technology === 'resin';
       body = `<div class="preset-panel"><label class="field"><span>Printer catalogue (${printerCatalogue.length} models)</span><select id="printer-catalogue"><option value="">Select a model or enter manually</option>${[...new Set(printerCatalogue.map(entry => entry.brand))].map(brand => `<optgroup label="${e(brand)}">${options(printerCatalogue.filter(entry => entry.brand === brand), '')}</optgroup>`).join('')}</select></label>
-        <label class="button secondary file-button spaced">${icon('upload')} Import slicer preset<input id="preset-upload" type="file" accept=".json,.ini,.cfg"></label>
-        <div id="preset-choice-root">${modal.presets?.length > 1 ? `<label class="field spaced"><span>Imported printer preset</span><select id="preset-choice">${modal.presets.map((preset, index) => `<option value="${index}" ${preset.name === p.name ? 'selected' : ''}>${e(preset.name)}</option>`).join('')}</select></label>` : ''}</div><p id="preset-status" class="helper" role="status">OrcaSlicer / Bambu Studio JSON; PrusaSlicer / SuperSlicer INI. Imports identity, nozzle and bed metadata only. Inherited values outside the file are not resolved.</p></div>
+        <label class="button secondary file-button spaced">${icon('upload')} Import preset / resin file metadata<input id="preset-upload" type="file" accept=".json,.ini,.cfg,${resinFileAccept}"></label>
+        <div id="preset-choice-root">${modal.presets?.length > 1 ? `<label class="field spaced"><span>Imported printer preset</span><select id="preset-choice">${modal.presets.map((preset, index) => `<option value="${index}" ${preset.name === p.name ? 'selected' : ''}>${e(preset.name)}</option>`).join('')}</select></label>` : ''}</div><p id="preset-status" class="helper" role="status">Orca/Bambu JSON; Prusa/SuperSlicer INI; supported resin job metadata. Imports identity and available geometry, not operating costs. External inheritance and native CHITUBOX/Lychee profile exports are not parsed.</p></div>
         <label class="field spaced-bottom"><span>Printer technology</span><select name="technology" data-profile-technology><option value="fdm" ${!resin ? 'selected' : ''}>Filament (FDM)</option><option value="resin" ${resin ? 'selected' : ''}>Resin (SLA / MSLA / DLP)</option></select></label>
         ${field('Printer name', 'name', p.name, { required: true })}${field('Description', 'model', p.model)}
         <div class="field-grid two">${field('Average power draw', 'watts', p.watts, { type: 'number', suffix: 'W', required: true, hint: 'Measured average, not rated peak.' })}${field('Purchase price', 'price', p.price, { type: 'number', suffix: '$', required: true })}${field('Usable print lifetime', 'lifetime', p.lifetime, { type: 'number', min: 1, suffix: 'hr', required: true, hint: 'Estimate; adjust for your printer.' })}${field('Maintenance & upkeep', 'maintenance', p.maintenance, { type: 'number', suffix: '$ / hr', required: true, hint: 'Exclude FEP and LCD wear if entered below.' })}</div>
         ${resin ? `<h3 class="spaced-bottom">Resin consumables & wash/curing power</h3><div class="field-grid two">${field('FEP / vat film reserve', 'fepPerPlate', p.fepPerPlate, { type: 'number', suffix: '$ / plate', required: true })}${field('IPA / cleaning solution', 'ipaPerPlate', p.ipaPerPlate, { type: 'number', suffix: '$ / plate', required: true })}${field('Cleanup / gloves / PPE', 'ppePerPlate', p.ppePerPlate, { type: 'number', suffix: '$ / plate', required: true })}${field('LCD / light-source wear', 'lcdPerHour', p.lcdPerHour, { type: 'number', suffix: '$ / hr', required: true })}${field('Wash station power', 'washWatts', p.washWatts, { type: 'number', suffix: 'W', required: true })}${field('Curing station power', 'cureWatts', p.cureWatts, { type: 'number', suffix: 'W', required: true })}</div><p class="helper">Enter your own reserves. Zero excludes that item. Consumables apply per complete plate; light-source wear applies per print hour.</p>` : ''}
-        <p class="helper">Catalogue entries and slicer presets do not supply purchase price, power or upkeep costs.</p>`;
+        ${resin ? `<details class="advanced"><summary>Display dimensions for optional reconstruction</summary><div class="field-grid two">${[['Display width', 'widthMm', 'mm'], ['Display height', 'heightMm', 'mm'], ['Resolution X', 'pixelsX', 'px'], ['Resolution Y', 'pixelsY', 'px']].map(([label, key, suffix]) =>
+          field(label, `geometry.${key}`, modal.draft?.[`geometry.${key}`] ?? p.geometry?.[key] ?? '', { type: 'number', min: key.startsWith('pixels') ? 1 : 0.001, max: key.startsWith('pixels') ? 32768 : 2000, step: key.startsWith('pixels') ? 1 : 'any', suffix })).join('')}</div><p class="helper">Leave all four blank if unknown. Dimensions must match your physical display. Presets do not define every sliced-file format.</p></details>` : ''}
+        <p class="helper">Catalogue entries and slicer presets do not supply purchase price, power or upkeep costs. Resin job files can supply printer identity and display geometry.</p>`;
     } else {
       const f = { name: '', brand: '', colorName: '', color: '#b5c3a5', price: 30, spoolWeight: 1000, density: 1.24, diameter: 1.75,
         kind: modal.materialKind || 'filament', bottleVolume: 1000, wastePercent: 0, ...item, ...modal.draft };
@@ -310,10 +345,11 @@ function renderModal() {
     title = id ? 'Edit print plate' : 'Add a print plate';
     body = `<label class="field spaced-bottom"><span>Print technology</span><select name="technology" data-plate-technology><option value="fdm" ${!resin ? 'selected' : ''}>Filament (FDM)</option><option value="resin" ${resin ? 'selected' : ''}>Resin</option></select></label>
       ${field('Plate name', 'name', p.name, { required: true })}
-      <div class="field-grid two">${field('Print time per plate', 'hours', p.hours, { type: 'number', min: 0.001, required: true, suffix: 'hours', hint: 'Decimal hours: 1h 30m = 1.5' })}${resin ? field('Resin volume per plate', 'volumeMl', p.volumeMl, { type: 'number', min: 0.01, required: true, suffix: 'mL' }) : field('Filament per plate', 'grams', p.grams, { type: 'number', min: 0.01, required: true, suffix: 'g' })}${field('Number of identical plates', 'quantity', p.quantity, { type: 'number', min: 1, step: 1, required: true })}
+      <div class="field-grid two">${field('Print time per plate', 'hours', p.hours, { type: 'number', min: 0.001, required: true, suffix: 'hours', hint: 'Decimal hours: 1h 30m = 1.5' })}${resin ? field('Resin volume per plate', 'volumeMl', p.volumeMl, { type: 'number', min: 0.000001, required: true, suffix: 'mL' }) : field('Filament per plate', 'grams', p.grams, { type: 'number', min: 0.01, required: true, suffix: 'g' })}${field('Number of identical plates', 'quantity', p.quantity, { type: 'number', min: 1, step: 1, required: true })}
       ${resin ? `${field('Wash time per plate', 'washMinutes', p.washMinutes, { type: 'number', suffix: 'min', required: true })}${field('Curing time per plate', 'cureMinutes', p.cureMinutes, { type: 'number', suffix: 'min', required: true })}` : ''}</div>
       <label class="field"><span>Printer</span><select name="printerId" required>${printers.length ? options(printers, p.printerId, favouriteLabel) : '<option value="">Add a matching printer first</option>'}</select></label><label class="field spaced"><span>${resin ? 'Resin' : 'Filament'}</span><select name="filamentId" required>${materials.length ? options(materials, p.filamentId, f => `${favouriteLabel(f)} · ${f.colorName}`) : '<option value="">Add a matching material first</option>'}</select></label>
-      <p class="helper">${resin ? 'Copy volume and time from your resin slicer, including supports. Wash/cure time calculates station electricity; add hands-on work to post-processing labour. Binary resin files are not imported.' : 'Include supports, brims and purge waste. Time and weight apply to one complete plate.'}</p>`;
+      <p class="helper">${resin ? 'Check volume and time against your resin slicer, including supports. Wash/cure time calculates station electricity; add hands-on work to post-processing labour.' : 'Include supports, brims and purge waste. Time and weight apply to one complete plate.'}</p>
+      ${p.resinImport?.volumeSource === 'reconstructed' ? '<div class="notice warning">Volume was reconstructed and may be inaccurate. Saving confirms you have reviewed this estimate. Enter a checked slicer value to replace it.</div>' : ''}`;
     footer = `<button type="button" class="button secondary" data-action="close-modal">Cancel</button><button class="button primary" type="submit">Save plate ${icon('check')}</button>`;
   } else if (kind === 'studio') {
     title = 'Studio details';
@@ -326,6 +362,15 @@ function renderModal() {
     title = 'Restore JSON backup?';
     body = `<p class="modal-description">This replaces the current draft, profiles, customers, saved invoices and settings on this site. Download your current backup first.</p><dl class="storage-details"><div><dt>Printers</dt><dd>${pendingBackup.printers.length}</dd></div><div><dt>Filaments</dt><dd>${pendingBackup.filaments.length}</dd></div><div><dt>Customers</dt><dd>${pendingBackup.customers.length}</dd></div><div><dt>Saved invoices</dt><dd>${pendingBackup.saved.length}</dd></div></dl>`;
     footer = '<button type="button" class="button secondary" data-action="backup-export">Back up current data</button><button type="button" class="button primary" data-action="restore-backup">Restore backup</button>';
+  } else if (kind === 'remove-profile') {
+    const printer = modal.profileType === 'printer';
+    const item = (printer ? state.printers : state.filaments).find(profile => profile.id === id);
+    const assigned = state.job.plates.filter(plate => (printer ? plate.printerId : plate.filamentId) === id).length;
+    title = `Remove ${printer ? 'printer' : materialKind(item) === 'resin' ? 'resin' : 'filament'} profile?`;
+    body = `<p>Remove <strong>${e(item.name)}</strong> from the current library?</p>
+      ${assigned ? `<div class="notice warning">Used by ${assigned} plate${assigned === 1 ? '' : 's'} in the current project. Reassign or remove those plates in Plates & pricing first.</div>` : ''}
+      <p class="helper">Saved invoices keep their own profiles. Opening a saved invoice restores its profile library.</p>`;
+    footer = `<button type="button" class="button secondary" data-action="close-modal">Cancel</button><button type="button" class="button primary" data-action="confirm-remove-profile" ${assigned ? 'disabled' : ''}>Remove profile</button>`;
   } else if (kind === 'confirm-new' || kind === 'confirm-reset' || kind === 'confirm-open' || kind === 'confirm-delete') {
     title = kind === 'confirm-reset' ? 'Reset this workspace?' : kind === 'confirm-delete' ? 'Delete this saved invoice?' : kind === 'confirm-open' ? 'Open this saved invoice?' : 'New project?';
     body = `<p class="modal-description">${kind === 'confirm-reset' ? 'This removes all 3-IG data from this browser, including profiles and saved invoices. Download anything you need first. This cannot be undone.' : kind === 'confirm-delete' ? 'This removes the saved snapshot. It does not remove a copy currently open in the workspace.' : 'Save your current project first if you want to keep it. Your current unsaved workspace will be replaced.'}</p>`;
@@ -351,6 +396,15 @@ function download(content, name, type) {
 function handleAction(button) {
   const action = button.dataset.action;
   const id = button.dataset.id;
+  if (action === 'resin-options') return showModal('resin-options', id);
+  if (action === 'slicer-metrics') return showModal('plate', id);
+  if (action === 'reconstruct') return startReconstruction(id);
+  if (action === 'profile-geometry') {
+    const plate = state.job.plates.find(item => item.id === id);
+    const shape = state.printers.find(item => item.id === plate.printerId).geometry;
+    if (!shape) { toast('Set all four display dimensions/resolution values in the assigned printer profile first.'); return; }
+    refreshModalDraft(shape); return;
+  }
   if (action === 'library-view') {
     state.settings.libraryViews[button.dataset.library] = button.dataset.view;
     persist(); render(); return;
@@ -386,7 +440,7 @@ function handleAction(button) {
   if (action === 'restore-backup') {
     try { localStorage.setItem(storageKey, JSON.stringify(pendingBackup)); }
     catch { toast('Restore failed: browser storage is unavailable or full. Existing data was not replaced.'); return; }
-    state = pendingBackup; storageError = ''; storageWriteError = '';
+    resinFiles.clear(); state = pendingBackup; storageError = ''; storageWriteError = '';
     closeModal(); view = 'data'; render(); toast('Backup restored.'); return;
   }
   if (action === 'preview' || action === 'save') {
@@ -406,7 +460,16 @@ function handleAction(button) {
   if (action === 'add-resin') return showModal('filament', null, { materialKind: 'resin' });
   if (action === 'add-printer' || action === 'add-filament') return showModal(action.replace('add-', ''));
   if (action === 'edit-printer' || action === 'edit-filament') return showModal(action.replace('edit-', ''), id);
-  if (action === 'remove-plate') { state.job.plates = state.job.plates.filter(plate => plate.id !== id); persist(); render(); }
+  if (action === 'remove-printer' || action === 'remove-filament') return showModal('remove-profile', id, { profileType: action.replace('remove-', '') });
+  if (action === 'confirm-remove-profile') {
+    try { removeProfile(state, modal.profileType, modal.id); }
+    catch (error) { toast(error.message); return; }
+    const saved = persist();
+    closeModal(); render();
+    if (saved) toast('Profile removed. Saved invoices are unchanged.');
+    return;
+  }
+  if (action === 'remove-plate') { resinFiles.delete(id); state.job.plates = state.job.plates.filter(plate => plate.id !== id); persist(); render(); }
   if (action === 'customer-type') {
     state.job.customerType = button.dataset.type;
     state.job.sections.business = button.dataset.type === 'business';
@@ -418,8 +481,9 @@ function handleAction(button) {
       try { localStorage.removeItem(storageKey); location.reload(); } catch { toast('Browser storage could not be reset. Check your browser settings.'); }
       return;
     }
-    if (modal.kind === 'confirm-new') { state.job = newJob(false, state.studio.currency); tab = 'plates'; pricingTab = 'printing'; view = 'invoice'; }
+    if (modal.kind === 'confirm-new') { resinFiles.clear(); state.job = newJob(false, state.studio.currency); tab = 'plates'; pricingTab = 'printing'; view = 'invoice'; }
     if (modal.kind === 'confirm-open') {
+      resinFiles.clear();
       const item = structuredClone(state.saved.find(saved => saved.job.id === modal.id));
       state.job = item.job;
       state.printers = item.printers;
@@ -490,6 +554,7 @@ document.addEventListener('change', event => {
   if (input.id === 'gcode-upload') { importFiles(input.files); return; }
   if (input.id === 'backup-upload') { importBackup(input.files[0]); input.value = ''; return; }
   if (input.id === 'preset-upload') { importPreset(input.files[0]); input.value = ''; return; }
+  if (input.id === 'resin-reselect') { reselectResin(input.files[0]); return; }
   if (input.matches('[data-profile-technology], [data-material-kind], [data-plate-technology]')) {
     refreshModalDraft(input.matches('[data-plate-technology]') ? { printerId: '', filamentId: '' } : {});
     return;
@@ -559,6 +624,8 @@ function updateField(input, report) {
 document.addEventListener('submit', event => {
   if (event.target.id !== 'modal-form') return;
   event.preventDefault();
+  if (modal.kind === 'resin-options') { startReconstruction(modal.id); return; }
+  if (modal.kind === 'reconstructing') return;
   if (!event.target.reportValidity()) return;
   const values = Object.fromEntries(new FormData(event.target));
   for (const input of event.target.querySelectorAll('input[type="number"]')) values[input.name] = Number(input.value);
@@ -574,6 +641,14 @@ document.addEventListener('submit', event => {
       toast('This profile is assigned to a plate. Add a separate profile for a different technology.'); return;
     }
     if (kind === 'filament') values.color = normalizeHex(values.color);
+    if (kind === 'printer') {
+      const keys = ['widthMm', 'heightMm', 'pixelsX', 'pixelsY'];
+      const filled = keys.filter(key => event.target.elements[`geometry.${key}`]?.value.trim());
+      if (filled.length && filled.length !== 4) { toast('Enter all four display geometry fields or leave them all blank.'); return; }
+      if (filled.length) values.geometry = Object.fromEntries(keys.map(key => [key, values[`geometry.${key}`]]));
+      else if (values.technology === 'resin') values.geometry = undefined;
+      for (const key of keys) delete values[`geometry.${key}`];
+    }
     const profile = { ...(current || { id: uid(), color: '#596c58', favourite: false }), ...values, ...(kind === 'printer' && modal.presetSource ? { source: modal.presetSource } : {}) };
     if (index >= 0) collection[index] = profile; else collection.push(profile);
     if (kind === 'filament' && materialKind(profile) === 'filament') for (const plate of state.job.plates.filter(plate => plate.filamentId === profile.id && plate.lengthMm)) {
@@ -582,9 +657,15 @@ document.addEventListener('submit', event => {
   }
   if (kind === 'plate') {
     const index = state.job.plates.findIndex(plate => plate.id === id);
-    const plate = { ...(state.job.plates[index] || { id: uid(), detail: 'Manual entry' }), ...values, verified: true };
+    const previous = state.job.plates[index];
+    const plate = { ...(previous || { id: uid(), detail: 'Manual entry' }), ...values, verified: true };
+    if (plate.resinImport) {
+      plate.resinImport = { ...plate.resinImport };
+      if (values.volumeMl !== previous.volumeMl) plate.resinImport.volumeSource = 'manual';
+      if (values.hours !== previous.hours) plate.resinImport.hoursSource = 'manual';
+    }
     if (plate.technology === 'resin') plate.grams = 0;
-    else { plate.volumeMl = 0; plate.washMinutes = 0; plate.cureMinutes = 0; }
+    else { plate.volumeMl = 0; plate.washMinutes = 0; plate.cureMinutes = 0; delete plate.resinImport; resinFiles.delete(plate.id); }
     delete plate.lengthMm;
     if (index >= 0) state.job.plates[index] = plate; else state.job.plates.push(plate);
   }
@@ -606,7 +687,8 @@ function refreshModalDraft(changes = {}) {
   renderModal();
 }
 function applyPrinterPreset(preset) {
-  refreshModalDraft({ name: preset.name, model: preset.model, technology: preset.technology });
+  refreshModalDraft({ name: preset.name, model: preset.model, technology: preset.technology,
+    ...Object.fromEntries(Object.entries(preset.geometry || {}).map(([key, value]) => [`geometry.${key}`, value])) });
   modal.presetSource = preset.source;
   document.querySelector('#preset-status').textContent = `${preset.name} selected. Review purchase price, power draw and upkeep costs before saving.`;
 }
@@ -614,8 +696,17 @@ async function importPreset(file) {
   if (!file) return;
   const currentModal = modal;
   try {
-    if (file.size > 5 * 1024 * 1024) throw new Error('Maximum preset file size is 5 MB.');
-    const presets = parsePrinterPresets(await file.text(), file.name);
+    let presets;
+    if (resinExtensions.test(file.name)) {
+      const info = await inspectResin(file);
+      if (!info.printerName) throw new Error('This sliced file has no printer identity. Enter the printer manually; its plate metrics can still be imported.');
+      const shape = Object.fromEntries(['widthMm', 'heightMm', 'pixelsX', 'pixelsY'].map(key => [key, info.geometry[key]]));
+      presets = [{ name: info.printerName, model: info.printerName, technology: 'resin', source: `${info.format} file metadata`,
+        ...(Object.values(shape).every(value => value > 0) ? { geometry: shape } : {}) }];
+    } else {
+      if (file.size > 5 * 1024 * 1024) throw new Error('Maximum preset file size is 5 MB.');
+      presets = parsePrinterPresets(await file.text(), file.name);
+    }
     if (modal !== currentModal) return;
     modal.presets = presets;
     document.querySelector('#preset-choice-root').innerHTML = presets.length > 1 ? `<label class="field spaced"><span>Imported printer preset</span><select id="preset-choice">${presets.map((preset, index) => `<option value="${index}">${e(preset.name)}</option>`).join('')}</select></label>` : '';
@@ -645,24 +736,37 @@ async function requestPersistentStorage() {
 }
 async function importFiles(files) {
   if (importing || !files?.length) return;
-  const selectedFilament = compatibleMaterials('fdm')[0], selectedPrinter = compatiblePrinters('fdm')[0];
-  if (!selectedFilament || !selectedPrinter) { toast('Add an FDM printer and filament profile before importing G-code. Resin plates use manual slicer metrics.'); return; }
+  files = [...files];
+  if (files.length > 50) { toast('Import at most 50 sliced files at once.'); return; }
   importing = true; render();
   const targetJob = state.job;
   const issues = [];
   let count = 0;
   for (const file of files) {
-    if (!/\.(gcode|gco|g)$/i.test(file.name)) { issues.push(`${file.name}: export plain-text .gcode; .3mf and binary G-code are not supported.`); continue; }
-    if (file.size > 25 * 1024 * 1024) { issues.push(`${file.name}: maximum file size is 25 MB.`); continue; }
+    const resin = resinExtensions.test(file.name);
+    if (!resin && !/\.(gcode|gco|g)$/i.test(file.name)) { issues.push(`${file.name}: use supported G-code, Photon Workshop / Anycubic, Photon/PhotonS, SL1/SL1S, GOO V3.0 or CTB v2/v3 files; other formats need manual slicer metrics.`); continue; }
+    if (!resin && file.size > 25 * 1024 * 1024) { issues.push(`${file.name}: maximum G-code size is 25 MB.`); continue; }
     try {
-      const filament = selectedFilament;
-      const metrics = parseGcode(await file.text(), filament.density, filament.diameter);
+      const technology = resin ? 'resin' : 'fdm';
+      const source = resin ? await inspectResin(file) : await file.text();
       if (state.job !== targetJob) { issues.push('Import cancelled because the current project changed.'); break; }
-      const missing = metrics.hours === null || metrics.grams === null;
-      state.job.plates.push({ id: uid(), name: file.name.replace(/\.(gcode|gco|g)$/i, '').replaceAll('_', ' '), detail: file.name,
-        hours: metrics.hours ?? 0, grams: metrics.grams ?? 0, quantity: 1, technology: 'fdm', volumeMl: 0, washMinutes: 0, cureMinutes: 0,
-        printerId: selectedPrinter.id, filamentId: filament.id, verified: !missing, lengthMm: metrics.lengthMm });
-      if (missing) issues.push(`${file.name}: ${metrics.hours === null ? 'print time' : ''}${metrics.hours === null && metrics.grams === null ? ' and ' : ''}${metrics.grams === null ? 'filament weight' : ''} not found. Edit the flagged plate before invoicing.`);
+      const filament = compatibleMaterials(technology)[0], printers = compatiblePrinters(technology);
+      if (!filament || !printers.length) throw new Error(`Add a ${resin ? 'resin printer and resin' : 'FDM printer and filament'} profile with your operating costs first.`);
+      const metrics = resin ? source : parseGcode(source, filament.density, filament.diameter);
+      const missingMetrics = [metrics.hours === null ? 'print time' : '', (resin ? metrics.volumeMl : metrics.grams) === null ? resin ? 'resin volume' : 'filament weight' : ''].filter(Boolean);
+      const missing = missingMetrics.length > 0;
+      const identity = value => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const printer = resin && metrics.printerName ? printers.find(item => identity(`${item.name} ${item.model}`).includes(identity(metrics.printerName))) || printers[0] : printers[0];
+      const plate = { id: uid(), name: file.name.replace(/\.[^.]+$/, '').replaceAll('_', ' '), detail: file.name,
+        hours: metrics.hours ?? 0, grams: resin ? 0 : metrics.grams ?? 0, quantity: 1, technology, volumeMl: resin ? metrics.volumeMl ?? 0 : 0, washMinutes: 0, cureMinutes: 0,
+        printerId: printer.id, filamentId: filament.id, verified: !missing,
+        ...(resin ? { resinImport: { ...metrics, hours: undefined, volumeMl: undefined, fileSize: file.size,
+          firstLayerHeightMm: metrics.firstLayerHeightMm ?? null, hoursSource: metrics.hours === null ? 'missing' : 'slicer',
+          volumeSource: metrics.volumeMl === null ? 'missing' : 'slicer' } } : { lengthMm: metrics.lengthMm }) };
+      state.job.plates.push(plate);
+      if (resin) resinFiles.set(plate.id, file);
+      if (missing) issues.push(`${file.name}: missing or invalid ${missingMetrics.join(' and ')}. Use slicer values${resin ? ' or open the plate import options for reconstruction availability' : ''}.`);
+      if (resin) issues.push(`${file.name}: confirm the suggested printer (${printer.name}) and resin (${filament.name}) before invoicing.`);
       count++;
     } catch (error) { issues.push(`${file.name}: ${error.message}`); }
   }
@@ -674,7 +778,59 @@ async function importFiles(files) {
     notice.textContent = issues.join('\n');
     root.querySelector('.plates-card')?.append(notice);
   }
-  if (saved) toast(`${count} plate${count !== 1 ? 's' : ''} imported.${issues.length ? ' Some files need attention; review flagged plates or retry unsupported files as plain-text G-code.' : ' Your pricing is up to date.'}`);
+  if (saved) toast(`${count} plate${count !== 1 ? 's' : ''} imported.${issues.length ? ' Review import notices and plate assignments.' : ' Your pricing is up to date.'}`);
+}
+async function reselectResin(file) {
+  if (!file || modal?.kind !== 'resin-options') return;
+  const currentModal = modal, plate = state.job.plates.find(item => item.id === modal.id);
+  try {
+    if (file.name !== plate.detail || file.size !== plate.resinImport.fileSize) throw new Error('Select the original file with the same name and size, or import it as a new plate.');
+    const info = await inspectResin(file);
+    if (info.format !== plate.resinImport.format || info.layers !== plate.resinImport.layers) throw new Error('The reselected file does not match this plate.');
+    if (modal !== currentModal) return;
+    resinFiles.set(plate.id, file);
+    refreshModalDraft();
+  } catch (error) { toast(`Cannot reselect sliced file: ${error.message}`); }
+}
+function startReconstruction(id) {
+  const form = modalRoot.querySelector('#modal-form');
+  if (!form.reportValidity()) return;
+  const file = resinFiles.get(id), plate = state.job.plates.find(item => item.id === id), targetJob = state.job;
+  if (!file) { toast('Reselect the original sliced file first.'); return; }
+  let shape;
+  try { shape = reconstructionGeometry(Object.fromEntries(new FormData(form))); }
+  catch (error) { document.querySelector('#reconstruction-error').textContent = error.message; return; }
+  shape.firstLayerHeightMm = Number(form.elements.firstLayerHeightMm.value);
+  let worker;
+  try { worker = new Worker(new URL('./resin-worker.js', import.meta.url), { type: 'module' }); }
+  catch (error) { document.querySelector('#reconstruction-error').textContent = `Reconstruction unavailable: ${error.message}. Use slicer values instead.`; return; }
+  reconstruction = { worker };
+  modal = { kind: 'reconstructing', id };
+  renderModal();
+  const failed = message => {
+    worker.terminate(); reconstruction = null;
+    if (state.job !== targetJob) return;
+    showModal('resin-options', id, { draft: shape });
+    document.querySelector('#reconstruction-error').textContent = `Reconstruction failed: ${message}. Enter slicer values instead.`;
+  };
+  worker.onerror = event => { if (reconstruction?.worker === worker) failed(event.message || 'The reconstruction worker could not run'); };
+  worker.onmessage = ({ data }) => {
+    if (reconstruction?.worker !== worker) return;
+    if (data.error) { failed(data.error); return; }
+    if (data.volumeMl !== undefined) {
+      worker.terminate(); reconstruction = null;
+      if (state.job !== targetJob || !state.job.plates.includes(plate)) return;
+      if (!Number.isFinite(data.volumeMl) || data.volumeMl <= 0) { failed('Invalid reconstructed volume'); return; }
+      plate.volumeMl = data.volumeMl; plate.verified = false;
+      plate.resinImport = { ...plate.resinImport, geometry: shape, firstLayerHeightMm: shape.firstLayerHeightMm, volumeSource: 'reconstructed' };
+      persist(); closeModal(); render(); showModal('plate', id);
+      toast('Potentially inaccurate reconstructed volume. Review and save the plate before export.');
+    } else {
+      document.querySelector('#reconstruction-progress').value = data.progress;
+      document.querySelector('#reconstruction-status').textContent = `${data.progress}%`;
+    }
+  };
+  worker.postMessage({ file, geometry: shape });
 }
 document.addEventListener('dragover', event => {
   if (event.target.closest('#drop-zone')) { event.preventDefault(); event.target.closest('#drop-zone').classList.add('dragging'); }

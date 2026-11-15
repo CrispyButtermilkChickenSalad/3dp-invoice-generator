@@ -134,12 +134,15 @@ export function invoiceCSV(job, totals) {
   };
   const rows = [['Invoice', job.number], ['Customer', job.customer.name], ['Project', job.name], [],
     ['Description', 'Quantity', `Amount (${currency})`],
-    ...totals.lines.map(line => [line.name, line.quantity, amount(line.amount)]),
+    ...totals.lines.map(line => [[line.name, resinEstimateNote(line)].filter(Boolean).join('\n'), line.quantity, amount(line.amount)]),
     [['Preparation, finishing and sundries', ...processingDescriptions(job)].join('\n'), '', amount(totals.serviceAmount)],
     ...(job.modelling?.enabled ? [[['3D modelling', job.modelling.description].filter(Boolean).join('\n'), 1, amount(totals.modelling)]] : []),
     ['Shipping', '', amount(totals.shipping)], ['Subtotal', '', amount(totals.subtotal)],
     ...(job.taxEnabled ? [['GST', '', amount(totals.tax)]] : []), [`Total ${currency}`, '', amount(totals.total)]];
   return rows.map(row => row.map(cell).join(',')).join('\r\n');
+}
+export function resinEstimateNote(plate) {
+  return plate.resinImport?.volumeSource === 'reconstructed' ? 'Resin volume reconstructed (potentially inaccurate).' : '';
 }
 
 export function processingDescriptions(job) {

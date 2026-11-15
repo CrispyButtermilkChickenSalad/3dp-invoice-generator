@@ -1,4 +1,5 @@
 import { calculate, uid, currencies } from './core.js';
+import { resinFormats } from './resin.js';
 
 export const printerCatalogue = [
   ['Bambu Lab', ['A1 mini', 'A1', 'P1P', 'P1S', 'P2S', 'X1 Carbon', 'X1E', 'H2D', 'H2S']],
@@ -36,7 +37,10 @@ function presetMetadata(data, fallback) {
       if (width > 0 && depth > 0) parts.push(`${width} × ${depth} mm bed`);
     }
   }
-  return { name, model: parts.join(' · '), source: 'Slicer preset', technology: /^(SLA|MSLA|DLP)$/i.test(String(data.printer_technology || '')) ? 'resin' : 'fdm' };
+  const geometry = Object.fromEntries(['display_width', 'display_height', 'display_pixels_x', 'display_pixels_y']
+    .map((key, index) => [['widthMm', 'heightMm', 'pixelsX', 'pixelsY'][index], Number(first(data[key]))]));
+  return { name, model: parts.join(' · '), source: 'Slicer preset', technology: /^(SLA|MSLA|DLP)$/i.test(String(data.printer_technology || '')) ? 'resin' : 'fdm',
+    ...(Object.values(geometry).every(value => Number.isFinite(value) && value > 0) ? { geometry: printerGeometry(geometry) } : {}) };
 }
 
 export function parsePrinterPresets(text, filename = 'printer.json') {
@@ -60,7 +64,7 @@ export function parsePrinterPresets(text, filename = 'printer.json') {
       const heading = line.match(/^\[([^\]]+)\]$/);
       if (heading) { push(); sectionName = heading[1]; section = {}; continue; }
       const pair = line.match(/^([a-z_]+)\s*=\s*(.*)$/i);
-      if (pair && ['printer_model', 'printer_settings_id', 'nozzle_diameter', 'bed_shape', 'printer_technology'].includes(pair[1])) section[pair[1]] = pair[2].replace(/^"|"$/g, '');
+      if (pair && ['printer_model', 'printer_settings_id', 'nozzle_diameter', 'bed_shape', 'printer_technology', 'display_width', 'display_height', 'display_pixels_x', 'display_pixels_y'].includes(pair[1])) section[pair[1]] = pair[2].replace(/^"|"$/g, '');
     }
     push();
     if (!sectionName && (section.printer_model || section.printer_settings_id)) candidates.push(section);
@@ -121,6 +125,30 @@ function studio(value) {
   if (!currencies.includes(currency)) throw new Error('Unsupported studio currency.');
   return { ...Object.fromEntries(['name', 'email', 'address', 'abn'].map(key => [key, string(value[key], `Studio ${key}`)])), currency };
 }
+function printerGeometry(value) {
+  record(value, 'Printer geometry');
+  const parsed = { widthMm: number(value.widthMm, 'display width', 0.001, 2000), heightMm: number(value.heightMm, 'display height', 0.001, 2000),
+    pixelsX: number(value.pixelsX, 'display resolution X', 1, 32768), pixelsY: number(value.pixelsY, 'display resolution Y', 1, 32768) };
+  if (!Number.isInteger(parsed.pixelsX) || !Number.isInteger(parsed.pixelsY)) throw new Error('Display resolution must be whole pixels.');
+  return parsed;
+}
+function resinImport(value) {
+  record(value, 'Resin metadata');
+  if (!resinFormats.includes(value.format)) throw new Error('Invalid resin format.');
+  if (![null, 'sl1', 'ctb2'].includes(value.reconstruction)) throw new Error('Invalid reconstruction method.');
+  for (const key of ['volumeSource', 'hoursSource']) {
+    if (!(key === 'volumeSource' ? ['slicer', 'manual', 'missing', 'reconstructed'] : ['slicer', 'manual', 'missing']).includes(value[key])) throw new Error('Invalid resin metric source.');
+  }
+  record(value.geometry, 'Resin geometry');
+  const geometry = Object.fromEntries(['widthMm', 'heightMm', 'pixelsX', 'pixelsY', 'layerHeightMm'].map(key =>
+    [key, value.geometry[key] === null ? null : number(value.geometry[key], key, key.startsWith('pixels') ? 1 : key === 'layerHeightMm' ? 0.000001 : 0.001, key.startsWith('pixels') ? 32768 : key === 'layerHeightMm' ? 5 : 2000)]));
+  if (['pixelsX', 'pixelsY'].some(key => geometry[key] !== null && !Number.isInteger(geometry[key]))) throw new Error('Invalid resin image resolution.');
+  return { format: value.format, printerName: string(value.printerName, 'Slicer printer name', 200), geometry,
+    layers: number(value.layers, 'resin layer count', 0, 100000), reconstruction: value.reconstruction,
+    reason: string(value.reason, 'Reconstruction availability', 1000), volumeSource: value.volumeSource, hoursSource: value.hoursSource,
+    fileSize: number(value.fileSize, 'resin file size', 0, 2 * 1024 ** 3),
+    firstLayerHeightMm: value.firstLayerHeightMm == null ? null : number(value.firstLayerHeightMm, 'first layer height', 0.000001, 5) };
+}
 function printer(value) {
   record(value, 'Printer');
   const technology = value.technology ?? 'fdm';
@@ -129,6 +157,7 @@ function printer(value) {
     watts: number(value.watts, 'wattage'), price: number(value.price, 'printer price'), lifetime: number(value.lifetime, 'printer lifetime', 1),
     maintenance: number(value.maintenance, 'maintenance'), color: color(value.color), technology,
     favourite: value.favourite === undefined ? false : boolean(value.favourite, 'printer favourite'),
+    ...(value.geometry === undefined ? {} : { geometry: printerGeometry(value.geometry) }),
     ...Object.fromEntries(['fepPerPlate', 'ipaPerPlate', 'ppePerPlate', 'lcdPerHour', 'washWatts', 'cureWatts'].map(key => [key, value[key] === undefined ? 0 : number(value[key], key)])),
     ...(value.source !== undefined ? { source: string(value.source, 'Preset source', 200) } : {}) };
 }
@@ -180,15 +209,28 @@ function job(value) {
       hours: number(plate.hours, 'print time'), grams: number(plate.grams, 'filament weight'), quantity,
       technology, volumeMl: number(plate.volumeMl ?? 0, 'resin volume'), washMinutes: number(plate.washMinutes ?? 0, 'wash time'), cureMinutes: number(plate.cureMinutes ?? 0, 'cure time'),
       printerId: identifier(plate.printerId), filamentId: identifier(plate.filamentId), verified: boolean(plate.verified, 'plate review flag'),
-      ...(plate.lengthMm !== undefined && plate.lengthMm !== null ? { lengthMm: number(plate.lengthMm, 'filament length', 0, Number.MAX_SAFE_INTEGER) } : {}) };
+      ...(plate.lengthMm !== undefined && plate.lengthMm !== null ? { lengthMm: number(plate.lengthMm, 'filament length', 0, Number.MAX_SAFE_INTEGER) } : {}),
+      ...(plate.resinImport === undefined ? {} : { resinImport: resinImport(plate.resinImport) }) };
   });
   return result;
 }
 function snapshot(value) {
   record(value, 'Invoice snapshot');
-  const result = { job: job(value.job), printers: list(value.printers, 'printers', printer, 1, 500), filaments: list(value.filaments, 'filaments', filament, 1, 500), studio: studio(value.studio) };
+  const result = { job: job(value.job), printers: list(value.printers, 'printers', printer, 0, 500), filaments: list(value.filaments, 'filaments', filament, 0, 500), studio: studio(value.studio) };
   calculate(result.job, result.printers, result.filaments);
   return result;
+}
+
+export function removeProfile(workspace, type, id) {
+  if (!['printer', 'filament'].includes(type)) throw new Error('Invalid profile type.');
+  const collection = type === 'printer' ? workspace.printers : workspace.filaments;
+  const index = collection.findIndex(item => item.id === id);
+  if (index < 0) throw new Error('This profile no longer exists.');
+  const reference = type === 'printer' ? 'printerId' : 'filamentId';
+  if (workspace.job.plates.some(plate => plate[reference] === id)) {
+    throw new Error('Reassign or remove plates using this profile before removing it.');
+  }
+  collection.splice(index, 1);
 }
 
 export function rememberCustomer(workspace, invoice) {
